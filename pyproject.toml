@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "student-loan-forecaster"
+version = "0.1.0"
+description = "Interactive UK Plan 2 student-loan forecaster"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.8,<4",
+    "streamlit>=1.40,<2",
+]
+
+[tool.setuptools]
+py-modules = ["student_loan_gui"]
