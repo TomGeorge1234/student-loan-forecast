@@ -17,4 +17,4 @@ dependencies = [
 package-mode = false
 
 [tool.setuptools]
-py-modules = ["student_loan_gui"]
+py-modules = ["student_loan_gui", "loan_rules"]

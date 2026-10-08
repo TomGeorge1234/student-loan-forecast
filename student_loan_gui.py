@@ -1,4 +1,4 @@
-"""Interactive UK Plan 2 student-loan forecaster."""
+"""Interactive multi-plan UK student-loan forecaster."""
 
 from __future__ import annotations
 
@@ -9,10 +9,21 @@ import altair as alt
 import numpy as np
 import streamlit as st
 
+from loan_rules import (
+    PLAN_1,
+    PLAN_2,
+    PLAN_4,
+    PLAN_5,
+    PLAN_NAMES,
+    PLAN_RULES,
+    POSTGRADUATE,
+    Loan,
+    allocate_required_repayments,
+    annual_interest_rate,
+    threshold_for_tax_year,
+)
 
-THRESHOLD = 29_385.0
-UPPER_INTEREST_THRESHOLD = 52_885.0
-START_MONTH = date.today().replace(day=1)
+TODAY_MONTH = date.today().replace(day=1)
 
 # Fixed samples from Seaborn's perceptually uniform crest and flare colour maps.
 SALARY_COLOR = "#3C6682"  # crest
@@ -87,6 +98,7 @@ class Projection:
 @dataclass(frozen=True)
 class SimulationSummary:
     months: tuple[date, ...]
+    monthly_repayment_median: np.ndarray
     salary_median: np.ndarray
     salary_low: np.ndarray
     salary_high: np.ndarray
@@ -111,23 +123,6 @@ class SimulationSummary:
     payoff_worthwhile_probability: float
 
 
-def interest_rate(
-    salary: float,
-    rpi: float,
-    lower: float,
-    upper: float,
-    cap: float | None = None,
-) -> float:
-    if salary <= lower:
-        extra = 0.0
-    elif salary >= upper:
-        extra = 0.03
-    else:
-        extra = 0.03 * (salary - lower) / (upper - lower)
-    rate = rpi + extra
-    return min(rate, cap) if cap is not None else rate
-
-
 def add_months(month: date, count: int = 1) -> date:
     """Return the first day of the month `count` months later."""
     index = month.year * 12 + month.month - 1 + count
@@ -137,66 +132,130 @@ def add_months(month: date, count: int = 1) -> date:
 def project(
     initial_salary: float,
     salary_growth: float,
-    initial_balance: float,
+    loans: tuple[Loan, ...],
     future_rpi: float,
-    write_off_month: date,
+    start_month: date = TODAY_MONTH,
     payoff_month: date | None = None,
     payoff_immediately: bool = False,
 ) -> Projection:
     rows: list[Row] = []
     annual_salary = initial_salary
-    balance = initial_balance
+    balances = np.array([loan.balance for loan in loans], dtype=float)[:, None]
+    plans = tuple(loan.plan for loan in loans)
     total_repaid = 0.0
     total_interest = 0.0
-    month = START_MONTH
+    amount_written_off = 0.0
+    month = start_month
     monthly_salary_growth = (1 + salary_growth) ** (1 / 12) - 1
+    final_write_off = max(loan.write_off_month for loan in loans)
+    annual_rpi = {
+        year: future_rpi
+        for year in range(TODAY_MONTH.year, final_write_off.year + 2)
+    }
 
-    while month < write_off_month and balance > 0.005:
+    while month <= final_write_off and np.any(balances > 0.005):
+        for index, loan in enumerate(loans):
+            if month >= loan.write_off_month and balances[index, 0] > 0:
+                amount_written_off += balances[index, 0]
+                balances[index, 0] = 0.0
+
+        opening_balances = balances.copy()
+        interest_active = np.array(
+            [month < loan.write_off_month for loan in loans], dtype=bool
+        )[:, None] & (balances > 0.005)
+        repayment_active = interest_active & np.array(
+            [month >= loan.repayment_start for loan in loans], dtype=bool
+        )[:, None]
         tax_year_start = month.year if month.month >= 4 else month.year - 1
-        indexed_years = max(0, tax_year_start - 2029)
-        lower = THRESHOLD * (1 + future_rpi) ** indexed_years
-        upper = UPPER_INTEREST_THRESHOLD * (1 + future_rpi) ** indexed_years
-        use_current_rate = month < date(2027, 9, 1)
-        rpi = 0.041 if use_current_rate else future_rpi
-        cap = 0.06 if use_current_rate else None
-        rate = interest_rate(annual_salary, rpi, lower, upper, cap)
+        thresholds = np.vstack(
+            [
+                np.atleast_1d(
+                    threshold_for_tax_year(
+                        PLAN_RULES[loan.plan], tax_year_start, annual_rpi
+                    )
+                )
+                for loan in loans
+            ]
+        )
+        salary_array = np.array([annual_salary])
+        rpi_array = np.array([future_rpi])
+        rates = np.vstack(
+            [
+                annual_interest_rate(
+                    PLAN_RULES[loan.plan],
+                    salary_array,
+                    rpi_array,
+                    thresholds[index],
+                    month,
+                )
+                for index, loan in enumerate(loans)
+            ]
+        )
 
-        is_now = payoff_immediately and month == START_MONTH
-        interest = 0.0 if is_now else balance * ((1 + rate) ** (1 / 12) - 1)
-        repayment = 0.0 if is_now else min(
-            balance + interest,
-            max(0.0, annual_salary - lower) * 0.09 / 12,
+        is_now = payoff_immediately and month == start_month
+        interest = np.where(
+            interest_active & (not is_now),
+            balances * ((1 + rates) ** (1 / 12) - 1),
+            0.0,
+        )
+        balances_due = balances + interest
+        repayments = (
+            np.zeros_like(balances)
+            if is_now
+            else allocate_required_repayments(
+                salary_array,
+                balances_due,
+                repayment_active,
+                thresholds,
+                plans,
+            )
         )
         is_payoff_month = payoff_month is not None and month == payoff_month
         voluntary = (
-            max(0.0, balance + interest - repayment)
+            np.maximum(0.0, balances_due - repayments)
             if is_now or is_payoff_month
+            else np.zeros_like(balances)
+        )
+        balances = np.maximum(0.0, balances_due - repayments - voluntary)
+        opening_total = float(np.sum(opening_balances))
+        interest_total = float(np.sum(interest))
+        repayment_total = float(np.sum(repayments))
+        voluntary_total = float(np.sum(voluntary))
+        weighted_rate = (
+            float(np.sum(rates * opening_balances) / opening_total)
+            if opening_total > 0
             else 0.0
         )
-        closing = max(0.0, balance + interest - repayment - voluntary)
         rows.append(
             Row(
                 month,
                 annual_salary,
-                balance,
-                rate,
-                interest,
-                repayment,
-                closing,
-                voluntary,
+                opening_total,
+                weighted_rate,
+                interest_total,
+                repayment_total,
+                float(np.sum(balances)),
+                voluntary_total,
             )
         )
-        total_repaid += repayment + voluntary
-        total_interest += interest
-        balance = closing
+        total_repaid += repayment_total + voluntary_total
+        total_interest += interest_total
 
-        if balance <= 0.005:
-            outcome = f"Repaid in {month.strftime('%B %Y')}"
+        if not np.any(balances > 0.005):
+            outcome = f"Repaid in {month.year}"
             if is_now:
-                outcome = "Paid off now"
+                outcome = "All loans paid off now"
             elif is_payoff_month:
-                outcome = f"Paid off in December {month.year}"
-            return Projection(tuple(rows), total_repaid, total_interest, 0.0, outcome)
+                outcome = f"All loans paid off in December {month.year}"
+            elif amount_written_off:
+                outcome = f"Final balance written off in {month.year}"
+            return Projection(
+                tuple(rows),
+                total_repaid,
+                total_interest,
+                amount_written_off,
+                outcome,
+            )
         annual_salary *= 1 + monthly_salary_growth
         month = add_months(month)
 
@@ -204,8 +263,8 @@ def project(
         tuple(rows),
         total_repaid,
         total_interest,
-        balance,
-        f"Written off in April {write_off_month.year}",
+        amount_written_off + float(np.sum(balances)),
+        f"Final balance written off in April {final_write_off.year}",
     )
 
 
@@ -213,24 +272,27 @@ def project(
 def simulate(
     initial_salary: float,
     mean_real_salary_growth: float,
-    initial_balance: float,
+    loans: tuple[Loan, ...],
     mean_rpi: float,
-    write_off_month: date,
+    start_month: date = TODAY_MONTH,
     payoff_month: date | None = None,
     payoff_immediately: bool = False,
     real_terms: bool = False,
     runs: int = SIMULATION_RUNS,
 ) -> SimulationSummary:
     """Simulate mean-reverting inflation and real-salary growth paths."""
-    display_end = add_months(write_off_month, 12)
+    final_write_off = max(loan.write_off_month for loan in loans)
+    display_end = add_months(final_write_off, 12)
     month_count = (
-        (display_end.year - START_MONTH.year) * 12
+        (display_end.year - start_month.year) * 12
         + display_end.month
-        - START_MONTH.month
+        - start_month.month
         + 1
     )
-    months = tuple(add_months(START_MONTH, offset) for offset in range(month_count))
-    years = tuple(range(START_MONTH.year, display_end.year + 1))
+    months = tuple(add_months(start_month, offset) for offset in range(month_count))
+    # Generate inflation from the present even for a future-start forecast so that
+    # thresholds whose statutory uprating begins before “Now” are indexed correctly.
+    years = tuple(range(TODAY_MONTH.year, display_end.year + 1))
     year_indices = {year: index for index, year in enumerate(years)}
 
     rng = np.random.default_rng(SIMULATION_SEED)
@@ -261,75 +323,101 @@ def simulate(
     # above remain statistically independent.
     salary_growth = np.maximum(annual_rpi + real_salary_growth, -0.99)
 
-    threshold_multipliers: dict[int, np.ndarray] = {}
-    multiplier = np.ones(runs)
-    for tax_year in range(2030, write_off_month.year + 1):
-        multiplier = multiplier * (1 + annual_rpi[year_indices[tax_year]])
-        threshold_multipliers[tax_year] = multiplier.copy()
+    annual_rpi_by_year = {
+        year: annual_rpi[index] for index, year in enumerate(years)
+    }
 
     salary = np.full(runs, initial_salary, dtype=float)
-    loan_balance = np.full(runs, initial_balance, dtype=float)
+    loan_balances = np.repeat(
+        np.array([loan.balance for loan in loans], dtype=float)[:, None],
+        runs,
+        axis=1,
+    )
+    plans = tuple(loan.plan for loan in loans)
     cumulative_repaid = np.zeros(runs)
     deflator = np.ones(runs)
     salary_paths = np.empty((month_count, runs))
     balance_paths = np.empty((month_count, runs))
     cumulative_paths = np.empty((month_count, runs))
+    monthly_repayment_paths = np.empty((month_count, runs))
 
     for offset, month in enumerate(months):
         year_index = year_indices[month.year]
-        loan_active = month < write_off_month
+        for index, loan in enumerate(loans):
+            if month >= loan.write_off_month:
+                loan_balances[index] = 0.0
 
-        if loan_active:
-            tax_year_start = month.year if month.month >= 4 else month.year - 1
-            threshold_multiplier = threshold_multipliers.get(tax_year_start, 1.0)
-            lower = THRESHOLD * threshold_multiplier
-            upper = UPPER_INTEREST_THRESHOLD * threshold_multiplier
-            current_rate_period = month < date(2027, 9, 1)
-            rpi_for_interest = (
-                np.full(runs, 0.041)
-                if current_rate_period
-                else annual_rpi[year_index]
-            )
-            extra_interest = np.clip(
-                0.03 * (salary - lower) / (upper - lower), 0.0, 0.03
-            )
-            interest_rate_values = rpi_for_interest + extra_interest
-            if current_rate_period:
-                interest_rate_values = np.minimum(interest_rate_values, 0.06)
-
-            is_now = payoff_immediately and month == START_MONTH
-            interest = (
-                np.zeros(runs)
-                if is_now
-                else loan_balance * ((1 + interest_rate_values) ** (1 / 12) - 1)
-            )
-            required_repayment = (
-                np.zeros(runs)
-                if is_now
-                else np.minimum(
-                    loan_balance + interest,
-                    np.maximum(0.0, salary - lower) * 0.09 / 12,
+        interest_active = np.array(
+            [month < loan.write_off_month for loan in loans], dtype=bool
+        )[:, None] & (loan_balances > 0.005)
+        repayment_active = interest_active & np.array(
+            [month >= loan.repayment_start for loan in loans], dtype=bool
+        )[:, None]
+        tax_year_start = month.year if month.month >= 4 else month.year - 1
+        thresholds = np.vstack(
+            [
+                np.broadcast_to(
+                    np.asarray(
+                        threshold_for_tax_year(
+                            PLAN_RULES[loan.plan],
+                            tax_year_start,
+                            annual_rpi_by_year,
+                        )
+                    ),
+                    (runs,),
                 )
+                for loan in loans
+            ]
+        )
+        rates = np.vstack(
+            [
+                annual_interest_rate(
+                    PLAN_RULES[loan.plan],
+                    salary,
+                    annual_rpi[year_index],
+                    thresholds[index],
+                    month,
+                )
+                for index, loan in enumerate(loans)
+            ]
+        )
+        is_now = payoff_immediately and month == start_month
+        interest = np.where(
+            interest_active & (not is_now),
+            loan_balances * ((1 + rates) ** (1 / 12) - 1),
+            0.0,
+        )
+        balances_due = loan_balances + interest
+        required_repayments = (
+            np.zeros_like(loan_balances)
+            if is_now
+            else allocate_required_repayments(
+                salary,
+                balances_due,
+                repayment_active,
+                thresholds,
+                plans,
             )
-            is_payoff_month = payoff_month is not None and month == payoff_month
-            voluntary_payment = (
-                np.maximum(0.0, loan_balance + interest - required_repayment)
-                if is_now or is_payoff_month
-                else np.zeros(runs)
-            )
-            loan_balance = np.maximum(
-                0.0,
-                loan_balance - required_repayment - voluntary_payment + interest,
-            )
-            monthly_repayment = required_repayment + voluntary_payment
-        else:
-            loan_balance = np.zeros(runs)
-            monthly_repayment = np.zeros(runs)
+        )
+        is_payoff_month = payoff_month is not None and month == payoff_month
+        voluntary_payments = (
+            np.maximum(0.0, balances_due - required_repayments)
+            if is_now or is_payoff_month
+            else np.zeros_like(loan_balances)
+        )
+        loan_balances = np.maximum(
+            0.0,
+            balances_due - required_repayments - voluntary_payments,
+        )
+        monthly_repayment = np.sum(required_repayments + voluntary_payments, axis=0)
 
         display_deflator = deflator if real_terms else 1.0
+        monthly_repayment_paths[offset] = (
+            np.sum(required_repayments, axis=0) / display_deflator
+        )
         cumulative_repaid = cumulative_repaid + monthly_repayment / display_deflator
         salary_paths[offset] = salary / display_deflator
-        balance_paths[offset] = loan_balance / display_deflator
+        balance_paths[offset] = np.sum(loan_balances, axis=0) / display_deflator
         cumulative_paths[offset] = cumulative_repaid
 
         salary = salary * (1 + salary_growth[year_index]) ** (1 / 12)
@@ -375,6 +463,7 @@ def simulate(
     final_repayments = cumulative_paths[-1]
     return SimulationSummary(
         months=months,
+        monthly_repayment_median=np.median(monthly_repayment_paths, axis=1),
         salary_median=salary_median,
         salary_low=salary_low,
         salary_high=salary_high,
@@ -397,7 +486,7 @@ def simulate(
         total_repaid_low=float(np.percentile(final_repayments, 2.5)),
         total_repaid_high=float(np.percentile(final_repayments, 97.5)),
         payoff_worthwhile_probability=float(
-            np.mean(final_repayments > initial_balance)
+            np.mean(final_repayments > sum(loan.balance for loan in loans))
         ),
     )
 
@@ -449,7 +538,7 @@ def payoff_verdict(probability: float, payoff_immediately: bool = False) -> str:
 @st.cache_data(show_spinner=False)
 def make_simulation_chart(
     summary: SimulationSummary,
-    write_off_month: date,
+    loan_write_offs: tuple[tuple[str, date], ...],
     real_terms: bool = False,
 ) -> dict:
     series = (
@@ -568,15 +657,19 @@ def make_simulation_chart(
             * 100,
             "Median repaid (£)": round(float(summary.cumulative_median[index]) / 100)
             * 100,
+            "Median monthly repayment (£)": round(
+                float(summary.monthly_repayment_median[index])
+            ),
         }
         for median, _fan_low, _fan_high, _color, label in series
         for index, month in enumerate(summary.months)
     ]
     median_tooltip = [
-        alt.Tooltip("month:T", title="Date", format="%b %Y"),
+        alt.Tooltip("month:T", title=None, format="%Y"),
         alt.Tooltip("Median salary (£):Q", format=",.0f"),
         alt.Tooltip("Median loan balance (£):Q", format=",.0f"),
         alt.Tooltip("Median repaid (£):Q", format=",.0f"),
+        alt.Tooltip("Median monthly repayment (£):Q", format=",.0f"),
     ]
     median_chart = (
         alt.Chart(alt.Data(values=median_values))
@@ -611,6 +704,9 @@ def make_simulation_chart(
             * 100,
             "Median repaid (£)": round(float(summary.cumulative_median[index]) / 100)
             * 100,
+            "Median monthly repayment (£)": round(
+                float(summary.monthly_repayment_median[index])
+            ),
         }
         for index, month in enumerate(summary.months)
     ]
@@ -701,18 +797,18 @@ def make_simulation_chart(
     ).encode(
         opacity=alt.condition(nearest_month, alt.value(1), alt.value(0))
     )
+    write_off_values = [
+        {"month": write_off.isoformat(), "plan": plan}
+        for plan, write_off in loan_write_offs
+    ]
     write_off_rule = (
-        alt.Chart(alt.Data(values=[{"month": write_off_month.isoformat()}]))
+        alt.Chart(alt.Data(values=write_off_values))
         .mark_rule(color="#999999", strokeDash=[5, 5], strokeWidth=0.75)
-        .encode(x="month:T")
+        .encode(x="month:T", detail="plan:N")
     )
-    write_off_label = (
+    write_off_labels = [
         alt.Chart(
-            alt.Data(
-                values=[
-                    {"month": write_off_month.isoformat(), "label": "written\noff"}
-                ]
-            )
+            alt.Data(values=[{"month": write_off.isoformat(), "label": plan}])
         )
         .mark_text(
             align="left",
@@ -723,13 +819,14 @@ def make_simulation_chart(
             lineBreak="\n",
             lineHeight=9,
         )
-        .encode(x="month:T", y=alt.value(4), text="label:N")
-    )
+        .encode(x="month:T", y=alt.value(4 + index * 11), text="label:N")
+        for index, (plan, write_off) in enumerate(loan_write_offs)
+    ]
     chart = (
         alt.layer(
             band_chart,
             write_off_rule,
-            write_off_label,
+            *write_off_labels,
             median_chart,
             example_chart,
             hover_points,
@@ -749,6 +846,11 @@ def make_simulation_chart(
 
 st.set_page_config(page_title="Student loan forecast", page_icon="📈", layout="wide")
 
+if "loan_ids" not in st.session_state:
+    st.session_state.loan_ids = [0]
+if "next_loan_id" not in st.session_state:
+    st.session_state.next_loan_id = 1
+
 with st.sidebar:
     st.header("Your assumptions")
     salary = st.number_input(
@@ -758,14 +860,98 @@ with st.sidebar:
         step=1000.0,
         format="%.0f",
     )
-    balance = st.number_input(
-        "Current loan balance (£)",
-        0.0,
-        value=77_500.0,
-        step=100.0,
-        format="%.0f",
+    forecast_start = TODAY_MONTH
+    st.markdown("**Student loans**")
+    loan_defaults = (
+        (PLAN_2, 75_000.0, 2019),
+        (POSTGRADUATE, 12_000.0, 2023),
+        (PLAN_1, 20_000.0, 2011),
+        (PLAN_4, 30_000.0, 2020),
+        (PLAN_5, 45_000.0, 2026),
     )
-    with st.expander("Advanced economic assumptions"):
+    entered_loans: list[Loan] = []
+    remove_loan_id: int | None = None
+    for position, loan_id in enumerate(st.session_state.loan_ids):
+        default_plan, default_balance, default_graduation_year = loan_defaults[
+            min(position, len(loan_defaults) - 1)
+        ]
+        saved_plan = st.session_state.get(f"loan_plan_{loan_id}", default_plan)
+        with st.expander(
+            f"Loan {position + 1} · {saved_plan}",
+            expanded=position == 0 or loan_id == st.session_state.loan_ids[-1],
+        ):
+            plan = st.selectbox(
+                "Repayment plan",
+                PLAN_NAMES,
+                index=PLAN_NAMES.index(default_plan),
+                key=f"loan_plan_{loan_id}",
+            )
+            loan_balance = st.number_input(
+                "Current loan balance (£)",
+                min_value=0.0,
+                value=default_balance,
+                step=100.0,
+                format="%.0f",
+                key=f"loan_balance_{loan_id}",
+            )
+            graduation_year = int(
+                st.number_input(
+                    "Graduation or course-leaving year",
+                    min_value=2007,
+                    max_value=forecast_start.year,
+                    value=min(default_graduation_year, forecast_start.year),
+                    step=1,
+                    format="%d",
+                    key=f"loan_graduation_{loan_id}",
+                    help=(
+                        "Used to estimate the April repayment start and write-off year. "
+                        "Part-time courses and older Plan 1/4 loans can follow different rules."
+                    ),
+                )
+            )
+            loan = Loan(plan, float(loan_balance), date(graduation_year, 7, 1))
+            entered_loans.append(loan)
+            st.caption(
+                f"Repayments assumed from {loan.repayment_start.year} · "
+                f"write-off {loan.write_off_month.year}"
+            )
+            if position > 0 and st.button(
+                "Remove this loan",
+                key=f"remove_loan_{loan_id}",
+                use_container_width=True,
+            ):
+                remove_loan_id = loan_id
+
+    if remove_loan_id is not None:
+        st.session_state.loan_ids.remove(remove_loan_id)
+        st.rerun()
+
+    if st.button(
+        "＋ Add another loan",
+        disabled=len(st.session_state.loan_ids) >= len(PLAN_NAMES),
+        use_container_width=True,
+    ):
+        st.session_state.loan_ids.append(st.session_state.next_loan_id)
+        st.session_state.next_loan_id += 1
+        st.rerun()
+
+    loans = tuple(entered_loans)
+    selected_plans = [loan.plan for loan in loans]
+    if len(selected_plans) != len(set(selected_plans)):
+        st.error(
+            "Add each repayment plan only once. Combine balances that belong to the "
+            "same plan, because payroll treats them as one plan balance."
+        )
+        st.stop()
+    expired_loans = [loan.plan for loan in loans if loan.write_off_month <= forecast_start]
+    if expired_loans:
+        st.error(
+            "The estimated write-off date has already passed for: "
+            + ", ".join(expired_loans)
+            + ". Check the loan's plan and course-leaving year."
+        )
+        st.stop()
+    with st.expander("Economic assumptions"):
         st.caption(
             "These long-run centres are planning assumptions. Historical data fit "
             "the persistence and annual shock size, not these two values."
@@ -799,31 +985,23 @@ with st.sidebar:
             f"{nominal_salary_growth:.2f}% implied nominal salary growth · "
             f"{future_rpi:.2f}% RPI"
         )
+    purchasing_power_basis = "today's £"
     real_terms = st.toggle(
-        "Purchasing-power view (today's £)",
+        f"Purchasing-power view ({purchasing_power_basis})",
         value=False,
-        help="Uses assumed RPI to show all chart values and comparisons in today's pounds.",
-    )
-    st.divider()
-    graduation_year = st.number_input(
-        "Graduation year",
-        min_value=2012,
-        max_value=START_MONTH.year,
-        value=2019,
-        step=1,
         help=(
-            "The model assumes you first became due to repay in April of the following "
-            "year. A Plan 2 balance is normally written off 30 years after that April."
+            "Uses simulated RPI to express chart values and comparisons in pounds "
+            "at today's prices."
         ),
     )
-    timer_start_year = int(graduation_year) + 1
-    write_off_month = date(timer_start_year + 30, 4, 1)
+    st.divider()
+    final_write_off = max(loan.write_off_month for loan in loans)
     payoff_choice = st.selectbox(
-        "Pay off in full",
-        ["Never", "Now"] + list(range(START_MONTH.year, write_off_month.year)),
+        "Pay off all loans in full",
+        ["Never", "Now"] + list(range(forecast_start.year, final_write_off.year)),
         help=(
-            "Now settles the entered balance immediately. A selected year settles "
-            "the remaining balance after that December's interest and required repayment."
+            "Now settles every entered balance immediately. A selected year settles "
+            "all remaining balances after that December's interest and required repayments."
         ),
     )
 
@@ -837,9 +1015,9 @@ rpi = future_rpi / 100
 projection = project(
     salary,
     nominal_salary_growth / 100,
-    balance,
+    loans,
     rpi,
-    write_off_month,
+    forecast_start,
     payoff_month,
     payoff_immediately,
 )
@@ -847,22 +1025,23 @@ with st.spinner(f"Simulating {SIMULATION_RUNS:,} possible futures..."):
     simulation = simulate(
         salary,
         real_salary_growth / 100,
-        balance,
+        loans,
         rpi,
-        write_off_month,
+        forecast_start,
         payoff_month,
         payoff_immediately,
         real_terms,
     )
 selected_plan_cost = simulation.total_repaid_median
-payoff_difference = selected_plan_cost - balance
-payoff_difference_low = simulation.total_repaid_low - balance
-payoff_difference_high = simulation.total_repaid_high - balance
+total_balance = sum(loan.balance for loan in loans)
+payoff_difference = selected_plan_cost - total_balance
+payoff_difference_low = simulation.total_repaid_low - total_balance
+payoff_difference_high = simulation.total_repaid_high - total_balance
 payoff_answer = payoff_verdict(
     simulation.payoff_worthwhile_probability,
     payoff_immediately,
 )
-if selected_plan_cost >= balance:
+if selected_plan_cost >= total_balance:
     payoff_outcome = "likely savings would be"
 else:
     payoff_outcome = "likely losses would be"
@@ -911,8 +1090,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-basis = " (today's £)" if real_terms else ""
-chart_spec = make_simulation_chart(simulation, write_off_month, real_terms)
+basis = f" ({purchasing_power_basis})" if real_terms else ""
+chart_spec = make_simulation_chart(
+    simulation,
+    tuple((loan.plan, loan.write_off_month) for loan in loans),
+    real_terms,
+)
 
 intro_column, results_column = st.columns([1, 1.45], gap="large")
 with intro_column:
@@ -925,7 +1108,7 @@ with intro_column:
         'your likely lifetime <span class="intro-highlight intro-repaid">repayments</span>. '
         "Inflation and real salary growth follow "
         "separate stochastic processes (mean-reverting AR(1) processes, fitted to historical economic data). "
-        "Use the purchasing-power view to express future £'s in today's £'s.",
+        "Use the purchasing-power view to express future money at today's prices.",
         unsafe_allow_html=True,
     )
 
@@ -954,39 +1137,30 @@ with results_column:
     st.vega_lite_chart(chart_spec, width="content", theme=None)
 
 st.subheader("Assumptions")
-simulation_assumption = (
-    f"- **Monte Carlo and AR(1):** {SIMULATION_RUNS:,} paths. An AR(1) is a standard "
-    "time-series model in which part of this year's departure from its long-run "
-    "average carries into next year, plus a new random shock. The app fits that "
-    "persistence and the shock size separately to annual ONS data from 2000–2025: "
-    "RPI persistence "
-    f"{RPI_PERSISTENCE:.2f} with {RPI_INNOVATION_STD * 100:.2f} percentage-point "
-    f"innovation volatility, and real-earnings persistence {REAL_SALARY_PERSISTENCE:.2f} "
-    f"with {REAL_SALARY_INNOVATION_STD * 100:.2f} percentage-point volatility. "
-    "The sidebar rates are chosen long-run centres, not outputs of this fit. Each "
-    "forecast year gets new, independent Gaussian inflation and real-pay shocks; "
-    "nominal salary growth combines the resulting RPI and real salary growth. The "
-    "continuous fan layers 31 closely spaced point-by-point percentile ranges, from "
-    "the central 5% through 95%, so shading fades toward the tails; these are prediction "
-    "ranges, not confidence intervals. "
-    "[ONS RPI](https://www.ons.gov.uk/economy/inflationandpriceindices/timeseries/chaw) "
-    "[ONS earnings](https://www.ons.gov.uk/employmentandlabourmarket/peopleinwork/earningsandworkinghours/timeseries/kab9)\n"
+loan_summary = "; ".join(
+    f"{loan.plan}: {money(loan.balance)}, leaving {loan.graduation_date.year}, "
+    f"write-off {loan.write_off_month.year}"
+    for loan in loans
+)
+threshold_summary = "; ".join(
+    f"{loan.plan} {money(PLAN_RULES[loan.plan].current_threshold)}"
+    for loan in loans
 )
 st.markdown(
     f"""
-- **Plan and pay basis:** Plan 2, using gross salary before tax and other deductions. [GOV.UK](https://www.gov.uk/repaying-your-student-loan/what-you-pay)
-- **Default economic outlook:** 2.50% long-run RPI and 1.25% real salary growth are rounded planning anchors, not fitted historical means. The OBR's July 2026 long-run projection uses 2.4% RPI and 3.8% nominal earnings, implying about 1.4% real earnings relative to RPI; 1.25% is a slightly conservative default. Historical ONS data instead determine the AR(1) persistence and volatility. [OBR](https://obr.uk/frs/fiscal-risks-and-sustainability-july-2026/)
-- **Selected outlook:** {real_salary_growth:.2f}% expected real salary growth and {future_rpi:.2f}% expected RPI, implying {nominal_salary_growth:.2f}% long-run nominal salary growth. Recent earnings growth was 3.5% for regular pay and 3.9% for total pay. [ONS](https://www.ons.gov.uk/employmentandlabourmarket/peopleinwork/employmentandemployeetypes/bulletins/averageweeklyearningsingreatbritain/september2026) [OBR forecasts](https://obr.uk/faq/where-can-i-find-your-latest-forecasts/)
-{simulation_assumption}- **Repayment rule:** 9% of earnings above the current {money(THRESHOLD)} threshold. [HMRC](https://www.gov.uk/guidance/special-rules-for-student-loans#plan-and-loan-types-and-thresholds)
-- **Threshold forecast:** frozen through 2029/30, then uprated using assumed RPI ({future_rpi:.2f}%). [DfE methodology](https://explore-education-statistics.service.gov.uk/methodology/student-loan-forecasts-for-england)
-- **Interest rule:** RPI plus 0–3% by income; 2026/27 uses 4.1% RPI and the current 6% cap. [GOV.UK](https://www.gov.uk/guidance/how-interest-is-calculated-plan-2)
-- **Write-off:** graduation in {int(graduation_year)} is assumed to make you first due to repay in April {timer_start_year}; any remaining balance is therefore written off in April {write_off_month.year}. [GOV.UK](https://www.gov.uk/repaying-your-student-loan/when-your-student-loan-gets-written-off-or-cancelled)
-- **Full payoff:** “Now” settles the current balance immediately. A selected year settles the balance after December's interest and required repayment. [GOV.UK](https://www.gov.uk/repaying-your-student-loan/make-extra-repayments)
-- **Payoff verdict:** based on the share of simulations in which projected repayments exceed today's payoff amount: Yes (at least 95%), Probably (67–95%), It's unclear (33–67%), Probably not (5–33%), or No (at most 5%).
-- **Today's-money view:** future values are divided by cumulative assumed RPI. ONS treats RPI as a legacy measure. [ONS](https://www.ons.gov.uk/economy/inflationandpriceindices/methodologies/calculatingtheretailpricesindex)
-- **Timing:** the forecast starts in {START_MONTH.strftime('%B %Y')}, inferred from the system date, and compounds salary, interest and repayments monthly.
-- **Important salary caveat:** the strongest—and likely least correct—assumption here is the salary path. It is impossible to know how an individual career will develop: promotions, career breaks, job changes, redundancy, bonuses, working hours and salary ceilings create jumps and structural changes. A stochastic exponential-growth model cannot represent these well, so the salary forecast is frankly likely to be flawed. Sorry!
-- **Limitations:** monthly estimate; payroll timing, bonuses, investment returns, liquidity, tax, risk, policy changes, and other voluntary repayments are excluded. Request an exact settlement figure before paying. [GOV.UK](https://www.gov.uk/repaying-your-student-loan/make-extra-repayments)
+The model follows your current salary and loan balances month by month from today, adding interest and subtracting repayments until each loan is paid off or written off.
+
+- **Salary and inflation:** your settings assume {real_salary_growth:.2f}% average annual salary growth above inflation and {future_rpi:.2f}% inflation (RPI). Together, these imply about {nominal_salary_growth:.2f}% annual salary growth in cash terms. The defaults are planning assumptions, not predictions about your career.
+- **How growth varies:** real salary growth and RPI inflation are modelled as mean-reverting AR(1) processes around your selected averages. This means unusually high or low growth tends to move back towards those averages over time, while new random changes occur each year. The persistence and variance of those stochastic processes are fitted to historical ONS data.
+- **Different possible futures:** the model runs {SIMULATION_RUNS:,} simulations, allowing salary growth and inflation to vary each year. The shaded chart shows the range of simulated outcomes; it is not a guarantee.
+- **Repayments:** you pay 9% of earnings above your undergraduate loan threshold, plus a separate 6% above the postgraduate threshold if you have one. Multiple undergraduate loans share the same 9% repayment. Your current annual thresholds are {threshold_summary}.
+- **Future loan rules:** the model applies announced rates and threshold changes, then assumes most thresholds rise with inflation. Plan 2's threshold stays frozen through 2029/30, and the postgraduate threshold stays at £21,000. Interest depends on your plan and, for Plan 2, your income. Future interest on Plans 1 and 4 is estimated using inflation alone.
+- **Write-off:** any remaining balance is cancelled after the modelled repayment period: 25 years for Plan 1, 30 for Plans 2, 4 and postgraduate, and 40 for Plan 5. Older loans and some course types can have different rules that this model does not cover.
+- **Paying off early:** “Now” means paying off today. Choosing a later year clears all remaining loans at the end of that year, after interest and normal repayments. The “Worth paying off now?” answer reflects how often simulated total repayments cost more than clearing your balances now.
+- **Today's money:** the purchasing-power view adjusts future amounts for simulated inflation, so you can compare them in {forecast_start.year} pounds.
+- **Main limitations:** salary is especially uncertain. Promotions, career breaks, job changes and bonuses can make your actual path very different. The model does not include investment returns, tax effects, future policy changes or other extra repayments.
+
+Use this as a planning estimate. Before clearing a loan, request an exact settlement figure from the [Student Loans Company](https://www.gov.uk/repaying-your-student-loan/make-extra-repayments).
 """
 )
 
@@ -1063,7 +1237,7 @@ with st.expander("View baseline monthly calculation"):
         running += row.repayment + row.voluntary_payment
         table.append(
             {
-                "Month": row.month.strftime("%Y-%m"),
+                "Year": row.month.year,
                 "Annual gross salary": round(row.salary / 100) * 100,
                 "Opening balance": round(row.opening_balance / 100) * 100,
                 "Annual interest rate": row.interest_rate,
