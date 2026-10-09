@@ -540,7 +540,22 @@ def make_simulation_chart(
     summary: SimulationSummary,
     loan_write_offs: tuple[tuple[str, date], ...],
     real_terms: bool = False,
+    payoff_month: date | None = None,
 ) -> dict:
+    # Quarterly points are sufficient for the background curves at this chart
+    # width. Keep monthly medians/tooltips and points around balance-clearing
+    # events so sampling does not smooth over a payoff or write-off.
+    plot_indices = set(range(0, len(summary.months), 3))
+    plot_indices.add(len(summary.months) - 1)
+    event_months = {month for _plan, month in loan_write_offs}
+    if payoff_month is not None:
+        event_months.add(payoff_month)
+    for index, month in enumerate(summary.months):
+        if month in event_months:
+            plot_indices.update(
+                range(max(0, index - 1), min(len(summary.months), index + 2))
+            )
+    plot_indices = sorted(plot_indices)
     series = (
         (
             summary.salary_median,
@@ -567,21 +582,22 @@ def make_simulation_chart(
     band_values = [
         {
             "month": month.isoformat(),
-            "low": float(low[index]),
-            "high": float(high[index]),
+            "low": round(float(low[index]), 2),
+            "high": round(float(high[index]), 2),
             "series": label,
             "band": band_index,
         }
         for _median, fan_low, fan_high, _color, label in series
         for band_index, (low, high) in enumerate(zip(fan_low, fan_high))
-        for index, month in enumerate(summary.months)
+        for index in plot_indices
+        for month in (summary.months[index],)
     ]
     color_scale = alt.Scale(
         domain=[item[4] for item in series],
         range=[item[3] for item in series],
     )
     band_chart = (
-        alt.Chart(alt.Data(values=band_values))
+        alt.Chart(alt.NamedData(name="forecast_bands"))
         .mark_area(opacity=0.018)
         .encode(
             x=alt.X("month:T", title=None),
@@ -665,14 +681,14 @@ def make_simulation_chart(
         for index, month in enumerate(summary.months)
     ]
     median_tooltip = [
-        alt.Tooltip("month:T", title=None, format="%Y"),
+        alt.Tooltip("month:T", title="Month", format="%b %Y"),
         alt.Tooltip("Median salary (£):Q", format=",.0f"),
         alt.Tooltip("Median loan balance (£):Q", format=",.0f"),
         alt.Tooltip("Median repaid (£):Q", format=",.0f"),
         alt.Tooltip("Median monthly repayment (£):Q", format=",.0f"),
     ]
     median_chart = (
-        alt.Chart(alt.Data(values=median_values))
+        alt.Chart(alt.NamedData(name="forecast_medians"))
         .mark_line(strokeWidth=1)
         .encode(
             x="month:T",
@@ -713,7 +729,7 @@ def make_simulation_chart(
     nearest_month = alt.selection_point(
         name="hover_month",
         nearest=True,
-        on="pointerover[!length(data('hover_trajectory_store'))]",
+        on="pointerover",
         fields=["month"],
         empty=False,
         clear="view:mouseleave",
@@ -721,7 +737,7 @@ def make_simulation_chart(
     hover_trajectory = alt.selection_point(
         name="hover_trajectory",
         nearest=True,
-        on="pointerover",
+        on="pointerover[!length(data('hover_trajectory_store'))]",
         fields=["trajectory"],
         empty=False,
         clear="view:mouseleave",
@@ -760,16 +776,17 @@ def make_simulation_chart(
     example_values = [
         {
             "month": month.isoformat(),
-            "value": float(paths[month_index, path_index]),
+            "value": round(float(paths[month_index, path_index]), 2),
             "series": label,
             "trajectory": path_index,
         }
         for paths, label in example_series
         for path_index in range(paths.shape[1])
-        for month_index, month in enumerate(summary.months)
+        for month_index in plot_indices
+        for month in (summary.months[month_index],)
     ]
     example_chart = (
-        alt.Chart(alt.Data(values=example_values))
+        alt.Chart(alt.NamedData(name="forecast_examples"))
         .mark_line(strokeWidth=0.65)
         .encode(
             x="month:T",
@@ -780,7 +797,7 @@ def make_simulation_chart(
         )
     )
     hover_selectors = (
-        alt.Chart(alt.Data(values=hover_values))
+        alt.Chart(alt.NamedData(name="forecast_hover"))
         .mark_rule(color="#666666", strokeWidth=0.75)
         .encode(
             x="month:T",
@@ -841,7 +858,16 @@ def make_simulation_chart(
         .configure_view(stroke=None)
         .configure_axis(grid=False, labelColor="#444444", titleColor="#444444")
     )
-    return chart.to_dict(validate=False)
+    # Attach numeric datasets after serializing the chart structure. This avoids
+    # Altair walking every record and lets the median line/points share one table.
+    spec = chart.to_dict(validate=False)
+    spec.setdefault("datasets", {}).update(
+        forecast_bands=band_values,
+        forecast_medians=median_values,
+        forecast_examples=example_values,
+        forecast_hover=hover_values,
+    )
+    return spec
 
 
 st.set_page_config(page_title="Student loan forecast", page_icon="📈", layout="wide")
@@ -1095,6 +1121,7 @@ chart_spec = make_simulation_chart(
     simulation,
     tuple((loan.plan, loan.write_off_month) for loan in loans),
     real_terms,
+    payoff_month,
 )
 
 intro_column, results_column = st.columns([1, 1.45], gap="large")
