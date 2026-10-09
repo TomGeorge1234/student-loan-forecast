@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import date
 
@@ -535,6 +536,41 @@ def payoff_verdict(probability: float, payoff_immediately: bool = False) -> str:
     return "No"
 
 
+def chart_data_revision(
+    summary: SimulationSummary,
+    loan_write_offs: tuple[tuple[str, date], ...],
+    payoff_month: date | None,
+) -> str:
+    """Return a stable version for the data embedded in a chart spec.
+
+    Streamlit transports named Vega-Lite datasets separately from the JSON spec
+    and expects their names to change with their contents. Keeping a fixed name
+    can leave Vega displaying its previous dataset after a Streamlit rerun.
+    """
+    digest = hashlib.blake2b(digest_size=8)
+    digest.update(repr((summary.months, loan_write_offs, payoff_month)).encode())
+    for values in (
+        summary.monthly_repayment_median,
+        summary.salary_median,
+        summary.salary_fan_low,
+        summary.salary_fan_high,
+        summary.balance_median,
+        summary.balance_fan_low,
+        summary.balance_fan_high,
+        summary.cumulative_median,
+        summary.cumulative_fan_low,
+        summary.cumulative_fan_high,
+        summary.salary_examples,
+        summary.balance_examples,
+        summary.cumulative_examples,
+    ):
+        contiguous = np.ascontiguousarray(values)
+        digest.update(contiguous.dtype.str.encode())
+        digest.update(repr(contiguous.shape).encode())
+        digest.update(contiguous.tobytes())
+    return digest.hexdigest()
+
+
 @st.cache_data(show_spinner=False)
 def make_simulation_chart(
     summary: SimulationSummary,
@@ -542,6 +578,11 @@ def make_simulation_chart(
     real_terms: bool = False,
     payoff_month: date | None = None,
 ) -> dict:
+    revision = chart_data_revision(summary, loan_write_offs, payoff_month)
+    dataset_names = {
+        name: f"forecast_{name}_{revision}"
+        for name in ("bands", "medians", "examples", "hover")
+    }
     # Quarterly points are sufficient for the background curves at this chart
     # width. Keep monthly medians/tooltips and points around balance-clearing
     # events so sampling does not smooth over a payoff or write-off.
@@ -597,7 +638,7 @@ def make_simulation_chart(
         range=[item[3] for item in series],
     )
     band_chart = (
-        alt.Chart(alt.NamedData(name="forecast_bands"))
+        alt.Chart(alt.NamedData(name=dataset_names["bands"]))
         .mark_area(opacity=0.018)
         .encode(
             x=alt.X("month:T", title=None),
@@ -688,7 +729,7 @@ def make_simulation_chart(
         alt.Tooltip("Median monthly repayment (£):Q", format=",.0f"),
     ]
     median_chart = (
-        alt.Chart(alt.NamedData(name="forecast_medians"))
+        alt.Chart(alt.NamedData(name=dataset_names["medians"]))
         .mark_line(strokeWidth=1)
         .encode(
             x="month:T",
@@ -786,7 +827,7 @@ def make_simulation_chart(
         for month in (summary.months[month_index],)
     ]
     example_chart = (
-        alt.Chart(alt.NamedData(name="forecast_examples"))
+        alt.Chart(alt.NamedData(name=dataset_names["examples"]))
         .mark_line(strokeWidth=0.65)
         .encode(
             x="month:T",
@@ -797,7 +838,7 @@ def make_simulation_chart(
         )
     )
     hover_selectors = (
-        alt.Chart(alt.NamedData(name="forecast_hover"))
+        alt.Chart(alt.NamedData(name=dataset_names["hover"]))
         .mark_rule(color="#666666", strokeWidth=0.75)
         .encode(
             x="month:T",
@@ -862,10 +903,12 @@ def make_simulation_chart(
     # Altair walking every record and lets the median line/points share one table.
     spec = chart.to_dict(validate=False)
     spec.setdefault("datasets", {}).update(
-        forecast_bands=band_values,
-        forecast_medians=median_values,
-        forecast_examples=example_values,
-        forecast_hover=hover_values,
+        {
+            dataset_names["bands"]: band_values,
+            dataset_names["medians"]: median_values,
+            dataset_names["examples"]: example_values,
+            dataset_names["hover"]: hover_values,
+        }
     )
     return spec
 
