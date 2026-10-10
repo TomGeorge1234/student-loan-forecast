@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import date
+from typing import Callable
 
 import numpy as np
 import streamlit as st
@@ -486,7 +487,6 @@ def simulate(
 
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
 def payoff_grid(
     salaries: tuple[float, ...],
     balances: tuple[float, ...],
@@ -496,6 +496,7 @@ def payoff_grid(
     start_month: date = TODAY_MONTH,
     real_terms: bool = False,
     runs: int = SIMULATION_RUNS,
+    _progress_callback: Callable[[float], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compare paying now with required repayments; rows are balances, columns salaries.
 
@@ -524,4 +525,6 @@ def payoff_grid(
                 )
             probabilities[row, column] = np.mean(totals > balance)
             savings[row, column] = np.median(totals) - balance
+            if _progress_callback is not None:
+                _progress_callback((row * len(salaries) + column + 1) / probabilities.size)
     return probabilities, savings

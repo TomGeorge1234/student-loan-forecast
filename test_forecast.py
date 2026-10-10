@@ -17,7 +17,7 @@ class PayoffGridTests(unittest.TestCase):
     def test_grid_matches_full_forecast_and_scales_multiple_loans(self):
         for real_terms in (False, True):
             with self.subTest(real_terms=real_terms):
-                probabilities, savings = payoff_grid.__wrapped__(
+                probabilities, savings = payoff_grid(
                     (0., 60_000.), (0., 100_000.), self.loans, .0125, .025,
                     TODAY_MONTH, real_terms, runs=30,
                 )
@@ -37,7 +37,7 @@ class PayoffGridTests(unittest.TestCase):
 
     def test_zero_loan_proportions_are_rejected(self):
         with self.assertRaisesRegex(ValueError, 'positive loan balance'):
-            payoff_grid.__wrapped__((50_000.,), (10_000.,),
+            payoff_grid((50_000.,), (10_000.,),
                                       (Loan(PLAN_2, 0, date(2019, 7, 1)),), .01, .025)
 
 

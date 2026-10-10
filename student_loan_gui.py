@@ -692,6 +692,32 @@ st.markdown(
         color: #7f520f; background: rgba(200, 135, 45, 0.20);
         border: 1px solid rgba(200, 135, 45, 0.34);
     }
+    .st-key-assumptions [data-testid="stMarkdownContainer"] p,
+    .st-key-assumptions [data-testid="stMarkdownContainer"] li {
+        font-size: 0.8rem; line-height: 1.55;
+    }
+    .st-key-payoff-explorer {
+        margin-top: 1.2rem;
+        border-radius: 0.8rem;
+    }
+    .payoff-explorer-title {
+        font-size: 1.05rem; font-weight: 600; margin: 0 0 0.3rem;
+    }
+    .payoff-explorer-description {
+        font-size: 0.9rem; line-height: 1.5; margin: 0; opacity: 0.8;
+    }
+    .st-key-payoff-explorer button {
+        border-radius: 0.6rem; min-height: 3rem; font-weight: 600;
+    }
+    .st-key-payoff-explorer button[kind="primary"] {
+        background-color: #3c6682; border-color: #3c6682; color: white;
+    }
+    .st-key-payoff-explorer button[kind="primary"]:hover {
+        background-color: #2d526a; border-color: #2d526a;
+    }
+    .st-key-payoff-explorer button[kind="primary"]:disabled {
+        opacity: 0.5;
+    }
     div[data-testid="stVegaLiteChart"] {
         display: flex; justify-content: center;
     }
@@ -708,22 +734,20 @@ chart_spec = make_simulation_chart(
     payoff_month,
 )
 
-intro_column, results_column = st.columns([1, 1.45], gap="large")
-with intro_column:
-    st.title("Student loan forecast")
-    st.markdown(
-        "Enter some basic information about your "
-        '<span class="intro-highlight intro-salary">salary</span> and '
-        '<span class="intro-highlight intro-loan">student loan</span>, and the '
-        f"dashboard will simulate {SIMULATION_RUNS:,} possible futures and estimate "
-        'your likely lifetime <span class="intro-highlight intro-repaid">repayments</span>. '
-        "Inflation and real salary growth follow "
-        "separate stochastic processes (mean-reverting AR(1) processes, fitted to historical economic data). "
-        "Use the purchasing-power view to express future money at today's prices.",
-        unsafe_allow_html=True,
-    )
+st.title("Student loan forecast")
+st.markdown(
+    "Enter some basic information about your "
+    '<span class="intro-highlight intro-salary">salary</span> and '
+    '<span class="intro-highlight intro-loan">student loan</span>, and the '
+    f"dashboard will simulate {SIMULATION_RUNS:,} possible futures and estimate "
+    'your likely lifetime <span class="intro-highlight intro-repaid">repayments</span>. '
+    "Inflation and real salary growth follow "
+    "separate stochastic processes (mean-reverting AR(1) processes, fitted to historical economic data). "
+    "Use the purchasing-power view to express future money at today's prices.",
+    unsafe_allow_html=True,
+)
 
-with results_column:
+with st.container():
     total_column, payoff_column = st.columns(2, gap="small")
     with total_column:
         st.markdown(
@@ -747,102 +771,134 @@ with results_column:
     st.markdown('<div style="height: 1rem;"></div>', unsafe_allow_html=True)
     st.vega_lite_chart(chart_spec, width="content", theme=None)
 
-with st.expander('“Worth paying off?” state space — optional'):
-    st.write(
-        "Explore current gross salary versus total loan balance. Colour shows the "
-        "chance that paying everything off now costs less than making only required "
-        "repayments until repayment or write-off. Above 50% favours paying now; "
-        "below 50% favours required repayments."
+salary_max = 200_000.0
+balance_max = 150_000.0
+resolution = 20
+grid_salaries = tuple(np.linspace(0, salary_max, resolution))
+grid_balances = tuple(np.linspace(0, balance_max, resolution))
+grid_inputs = (
+    grid_salaries, grid_balances, loans, real_salary_growth / 100,
+    rpi, forecast_start, real_terms,
+)
+with st.container(border=True, key="payoff-explorer"):
+    question_column, button_column = st.columns([1.7, 1], gap="large", vertical_alignment="center")
+    with question_column:
+        st.markdown(
+            '<h3 class="payoff-explorer-title">Explore repayment outcomes in a [salary × loan] state-space</h3>',
+            unsafe_allow_html=True,
+        )
+    with button_column:
+        generate_heatmap = st.button(
+            "Explore salary and loan balance", type="primary",
+            use_container_width=True, disabled=total_balance <= 0,
+        )
+    if total_balance <= 0:
+        st.caption("Enter a positive loan balance to explore repayment savings.")
+if generate_heatmap:
+    progress = st.progress(0, text="Simulating salary and loan combinations… 0%")
+    def update_heatmap_progress(fraction):
+        progress.progress(fraction, text=f"Simulating salary and loan combinations… {fraction:.0%}")
+    try:
+        result = payoff_grid(*grid_inputs, _progress_callback=update_heatmap_progress)
+        progress.progress(1.0, text="Heatmap complete")
+        st.session_state.payoff_map = (grid_inputs, result)
+    finally:
+        progress.empty()
+
+saved_map = st.session_state.get("payoff_map")
+if saved_map is not None and saved_map[0] != grid_inputs:
+    st.info("Assumptions have changed. Click the button above to update the heatmap.")
+elif saved_map is not None:
+    probabilities, savings = saved_map[1]
+    heatmap_units = "today's £" if real_terms else "£"
+    show_savings = st.toggle("Show savings vs. paying off now", value=True)
+    lifetime_repayments = savings + np.array(grid_balances)[:, None]
+    salary_edges = np.concatenate((
+        [0], (np.array(grid_salaries[:-1]) + grid_salaries[1:]) / 2, [salary_max],
+    ))
+    balance_edges = np.concatenate((
+        [0], (np.array(grid_balances[:-1]) + grid_balances[1:]) / 2, [balance_max],
+    ))
+    cells = [
+        {
+            "Salary": annual_salary, "Loan": balance,
+            "x0": salary_edges[column], "x1": salary_edges[column + 1],
+            "y0": balance_edges[row], "y1": balance_edges[row + 1],
+            "Probability": probabilities[row, column],
+            "Median savings": savings[row, column],
+            "Lifetime repayments": lifetime_repayments[row, column],
+            "Repayments display": f"£{lifetime_repayments[row, column]:,.0f}",
+            "Savings display": f"{'−' if savings[row, column] < 0 else ''}£{abs(savings[row, column]):,.0f}",
+            "Verdict": "No loan" if balance == 0 else payoff_verdict(probabilities[row, column]),
+        }
+        for row, balance in enumerate(grid_balances)
+        for column, annual_salary in enumerate(grid_salaries)
+    ]
+    savings_limit = max(float(np.max(np.abs(savings))), 1.0)
+    if show_savings:
+        colour_field = "Median savings:Q"
+        legend_title = f"Median savings ({heatmap_units})"
+        colour_scale = alt.Scale(
+            domain=[-savings_limit, 0, savings_limit],
+            range=[LOAN_COLOR, "#f7f7f7", SALARY_COLOR],
+        )
+        colour_description = "Blue means savings; pink means paying now costs more; white means no saving."
+    else:
+        colour_field = "Lifetime repayments:Q"
+        legend_title = f"Lifetime repayments ({heatmap_units})"
+        colour_scale = alt.Scale(
+            domain=[0, max(float(np.max(lifetime_repayments)), 1.0)],
+            range=["#f7f7f7", SALARY_COLOR],
+        )
+        colour_description = "Darker blue means higher median lifetime repayments with required repayments only."
+    currency_tick = (
+        "(datum.value < 0 ? '−' : '') + '£' + "
+        "(abs(datum.value) >= 1000 ? format(abs(datum.value) / 1000, '~g') + 'k' "
+        ": format(abs(datum.value), '~g'))"
+    )
+    heatmap = alt.Chart(alt.Data(values=cells)).mark_rect().encode(
+        x=alt.X("x0:Q", title=f"Current gross annual salary ({heatmap_units})",
+                scale=alt.Scale(domain=[0, salary_max], nice=False), axis=alt.Axis(labelExpr=currency_tick)),
+        x2="x1:Q",
+        y=alt.Y("y0:Q", title=f"Total loan balance ({heatmap_units})",
+                scale=alt.Scale(domain=[0, balance_max], nice=False), axis=alt.Axis(labelExpr=currency_tick)),
+        y2="y1:Q",
+        color=alt.Color(
+            colour_field, title=legend_title, scale=colour_scale,
+            legend=alt.Legend(labelExpr=currency_tick, orient="top", gradientLength=300),
+        ),
+        tooltip=[
+            alt.Tooltip("Salary:Q", title=f"Salary ({heatmap_units})", format=",.0f"),
+            alt.Tooltip("Loan:Q", title=f"Loan ({heatmap_units})", format=",.0f"),
+            alt.Tooltip("Probability:Q", title="Chance paying off now saves money", format=".1%"),
+            alt.Tooltip("Verdict:N"),
+            alt.Tooltip("Repayments display:N", title=f"Median lifetime repayments{basis}"),
+            alt.Tooltip("Savings display:N", title=f"Median saving by paying off now{basis}"),
+        ],
+    )
+    if salary <= salary_max and total_balance <= balance_max:
+        marker = alt.Chart(alt.Data(values=[{"salary": salary, "balance": total_balance}])).mark_point(
+            shape="cross", size=180, color="black", strokeWidth=2, tooltip=False,
+        ).encode(x="salary:Q", y="balance:Q")
+        heatmap = heatmap + marker
+    else:
+        st.caption("Your current salary or balance is outside the heatmap ranges.")
+    st.altair_chart(
+        heatmap.properties(
+            width=500, height=500,
+            autosize=alt.AutoSizeParams(type="pad", contains="content"),
+        ),
+        width="content",
     )
     st.caption(
-        "Uses your current growth, inflation, purchasing-power setting, loan plans "
-        "and write-off dates. Multiple loan balances keep their current proportions. "
-        "This comparison always uses required repayments, regardless of the sidebar "
-        "payoff date. It excludes investment returns and the value of keeping cash. "
-        "Nothing is calculated until you click Generate heatmap."
+        f"{resolution} × {resolution} grid · {SIMULATION_RUNS:,} futures per point · "
+        f"{'Today’s purchasing power' if real_terms else 'Nominal cash amounts'} · "
+        "Black cross marks your inputs when in range. Hover over any cell to see "
+        "the chance paying off now saves money, median lifetime repayments and the median amount saved. "
+        "Negative savings mean paying now costs more. "
+        + colour_description
     )
-    salary_max = 200_000.0
-    balance_max = 150_000.0
-    resolution = 12
-    grid_salaries = tuple(np.linspace(0, salary_max, resolution))
-    grid_balances = tuple(np.linspace(0, balance_max, resolution))
-    grid_inputs = (
-        grid_salaries, grid_balances, loans, real_salary_growth / 100,
-        rpi, forecast_start, real_terms,
-    )
-    if total_balance <= 0:
-        st.info("Enter a positive loan balance to establish the loan proportions.")
-    if st.button("Generate heatmap", disabled=total_balance <= 0):
-        with st.spinner("Simulating salary and loan combinations…"):
-            result = payoff_grid(*grid_inputs)
-            st.session_state.payoff_map = (grid_inputs, result)
 
-    saved_map = st.session_state.get("payoff_map")
-    if saved_map is not None and saved_map[0] != grid_inputs:
-        st.info("Assumptions have changed. Generate the heatmap to update it.")
-    elif saved_map is not None:
-        probabilities, savings = saved_map[1]
-        salary_edges = np.concatenate((
-            [0], (np.array(grid_salaries[:-1]) + grid_salaries[1:]) / 2, [salary_max],
-        ))
-        balance_edges = np.concatenate((
-            [0], (np.array(grid_balances[:-1]) + grid_balances[1:]) / 2, [balance_max],
-        ))
-        cells = [
-            {
-                "Salary": annual_salary, "Loan": balance,
-                "x0": salary_edges[column], "x1": salary_edges[column + 1],
-                "y0": balance_edges[row], "y1": balance_edges[row + 1],
-                "Probability": probabilities[row, column],
-                "Median savings": savings[row, column],
-                "Verdict": "No loan" if balance == 0 else payoff_verdict(probabilities[row, column]),
-            }
-            for row, balance in enumerate(grid_balances)
-            for column, annual_salary in enumerate(grid_salaries)
-        ]
-        heatmap = alt.Chart(alt.Data(values=cells)).mark_rect().encode(
-            x=alt.X("x0:Q", title="Current gross annual salary (£)",
-                    scale=alt.Scale(domain=[0, salary_max], nice=False), axis=alt.Axis(format=",.0f")),
-            x2="x1:Q",
-            y=alt.Y("y0:Q", title="Total loan balance (£)",
-                    scale=alt.Scale(domain=[0, balance_max], nice=False), axis=alt.Axis(format=",.0f")),
-            y2="y1:Q",
-            color=alt.Color(
-                "Probability:Q", title="Chance paying now saves money",
-                scale=alt.Scale(domain=[0, 0.5, 1], range=[LOAN_COLOR, "#f7f7f7", SALARY_COLOR]),
-                legend=alt.Legend(format=".0%", orient="bottom", gradientLength=300),
-            ),
-            tooltip=[
-                alt.Tooltip("Salary:Q", title="Salary (£)", format=",.0f"),
-                alt.Tooltip("Loan:Q", title="Loan (£)", format=",.0f"),
-                alt.Tooltip("Probability:Q", format=".0%"),
-                alt.Tooltip("Verdict:N"),
-                alt.Tooltip("Median savings:Q", title=f"Median savings (£){basis}", format=",.0f"),
-            ],
-        )
-        if salary <= salary_max and total_balance <= balance_max:
-            marker = alt.Chart(alt.Data(values=[{"salary": salary, "balance": total_balance}])).mark_point(
-                shape="cross", size=180, color="black", strokeWidth=2,
-            ).encode(x="salary:Q", y="balance:Q", tooltip=alt.value("Your current salary and balance"))
-            heatmap = heatmap + marker
-        else:
-            st.caption("Your current salary or balance is outside the heatmap ranges.")
-        st.altair_chart(
-            heatmap.properties(
-                width=500, height=500,
-                autosize=alt.AutoSizeParams(type="pad", contains="content"),
-            ),
-            width="content",
-        )
-        st.caption(
-            f"{resolution} × {resolution} grid · {SIMULATION_RUNS:,} futures per point · "
-            f"{'Today’s purchasing power' if real_terms else 'Nominal cash amounts'} · "
-            "Black cross marks your inputs when in range. Hover for the sampled values "
-            "and median savings (negative means paying now costs more). "
-            "White indicates roughly even odds; zero balance means no saving."
-        )
-
-st.subheader("Assumptions")
 loan_summary = "; ".join(
     f"{loan.plan}: {money(loan.balance)}, leaving {loan.graduation_date.year}, "
     f"write-off {loan.write_off_month.year}"
@@ -852,8 +908,10 @@ threshold_summary = "; ".join(
     f"{loan.plan} {money(PLAN_RULES[loan.plan].current_threshold)}"
     for loan in loans
 )
-st.markdown(
-    f"""
+with st.container(key="assumptions"):
+    with st.expander("Assumptions", expanded=False):
+        st.markdown(
+            f"""
 The model follows your current salary and loan balances month by month from today, adding interest and subtracting repayments until each loan is paid off or written off.
 
 - **Salary and inflation:** your settings assume {real_salary_growth:.2f}% average annual salary growth above inflation and {future_rpi:.2f}% inflation (RPI). Together, these imply about {nominal_salary_growth:.2f}% annual salary growth in cash terms. The defaults are planning assumptions, not predictions about your career.
@@ -867,8 +925,8 @@ The model follows your current salary and loan balances month by month from toda
 - **Main limitations:** salary is especially uncertain. Promotions, career breaks, job changes and bonuses can make your actual path very different. The model does not include investment returns, tax effects, future policy changes or other extra repayments.
 
 Use this as a planning estimate. Before clearing a loan, request an exact settlement figure from the [Student Loans Company](https://www.gov.uk/repaying-your-student-loan/make-extra-repayments).
-"""
-)
+            """
+        )
 
 with st.expander("How the AR(1) models are fitted"):
     st.markdown(
