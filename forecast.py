@@ -257,7 +257,7 @@ def project(
     )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=f"Simulating {SIMULATION_RUNS:,} possible futures...")
 def simulate(
     initial_salary: float,
     mean_real_salary_growth: float,
@@ -269,8 +269,20 @@ def simulate(
     real_terms: bool = False,
     runs: int = SIMULATION_RUNS,
     totals_only: bool = False,
-) -> SimulationSummary | np.ndarray:
+    *,
+    both_views: bool = False,
+    rpi_persistence: float = RPI_PERSISTENCE,
+    rpi_innovation_std: float = RPI_INNOVATION_STD,
+    salary_persistence: float = REAL_SALARY_PERSISTENCE,
+    salary_innovation_std: float = REAL_SALARY_INNOVATION_STD,
+) -> SimulationSummary | np.ndarray | tuple[SimulationSummary, SimulationSummary]:
     """Simulate growth paths, returning chart summaries or just total repayments."""
+    if not (0 <= rpi_persistence < 1) or not np.isfinite(rpi_innovation_std) or rpi_innovation_std < 0:
+        raise ValueError("RPI persistence must be between 0 and 1, and volatility must be nonnegative.")
+    if not (0 <= salary_persistence < 1) or not np.isfinite(salary_innovation_std) or salary_innovation_std < 0:
+        raise ValueError("Salary persistence must be between 0 and 1, and volatility must be nonnegative.")
+    if both_views:
+        real_terms = False
     final_write_off = max(loan.write_off_month for loan in loans)
     display_end = add_months(final_write_off, 12)
     month_count = (
@@ -295,14 +307,14 @@ def simulate(
         salary_innovation = rng.normal(size=runs)
         current_rpi = (
             mean_rpi
-            + RPI_PERSISTENCE * (previous_rpi - mean_rpi)
-            + RPI_INNOVATION_STD * inflation_innovation
+            + rpi_persistence * (previous_rpi - mean_rpi)
+            + rpi_innovation_std * inflation_innovation
         )
         current_real_growth = (
             mean_real_salary_growth
-            + REAL_SALARY_PERSISTENCE
+            + salary_persistence
             * (previous_real_growth - mean_real_salary_growth)
-            + REAL_SALARY_INNOVATION_STD * salary_innovation
+            + salary_innovation_std * salary_innovation
         )
         annual_rpi[year_index] = np.maximum(current_rpi, -0.99)
         real_salary_growth[year_index] = np.maximum(current_real_growth, -0.99)
@@ -325,12 +337,19 @@ def simulate(
     )
     plans = tuple(loan.plan for loan in loans)
     cumulative_repaid = np.zeros(runs)
+    if both_views:
+        real_cumulative_repaid = np.zeros(runs)
     deflator = np.ones(runs)
     if not totals_only:
         salary_paths = np.empty((month_count, runs))
         balance_paths = np.empty((month_count, runs))
         cumulative_paths = np.empty((month_count, runs))
         monthly_repayment_paths = np.empty((month_count, runs))
+        if both_views:
+            real_salary_paths = np.empty_like(salary_paths)
+            real_balance_paths = np.empty_like(balance_paths)
+            real_cumulative_paths = np.empty_like(cumulative_paths)
+            real_monthly_repayment_paths = np.empty_like(monthly_repayment_paths)
 
     for offset, month in enumerate(months):
         year_index = year_indices[month.year]
@@ -404,6 +423,8 @@ def simulate(
 
         display_deflator = deflator if real_terms else 1.0
         cumulative_repaid = cumulative_repaid + monthly_repayment / display_deflator
+        if both_views:
+            real_cumulative_repaid += monthly_repayment / deflator
         if not totals_only:
             monthly_repayment_paths[offset] = (
                 np.sum(required_repayments, axis=0) / display_deflator
@@ -411,12 +432,17 @@ def simulate(
             salary_paths[offset] = salary / display_deflator
             balance_paths[offset] = np.sum(loan_balances, axis=0) / display_deflator
             cumulative_paths[offset] = cumulative_repaid
+            if both_views:
+                real_salary_paths[offset] = salary / deflator
+                real_balance_paths[offset] = np.sum(loan_balances, axis=0) / deflator
+                real_cumulative_paths[offset] = real_cumulative_repaid
+                real_monthly_repayment_paths[offset] = np.sum(required_repayments, axis=0) / deflator
 
         salary = salary * (1 + salary_growth[year_index]) ** (1 / 12)
         deflator = deflator * (1 + annual_rpi[year_index]) ** (1 / 12)
 
     if totals_only:
-        return cumulative_repaid
+        return np.stack((cumulative_repaid, real_cumulative_repaid)) if both_views else cumulative_repaid
 
     def summarize(
         paths: np.ndarray,
@@ -434,56 +460,66 @@ def simulate(
         fan_high = quantiles[band_count + 1 :]
         return median, fan_low[-1], fan_high[-1], fan_low, fan_high
 
-    (
-        salary_median,
-        salary_low,
-        salary_high,
-        salary_fan_low,
-        salary_fan_high,
-    ) = summarize(salary_paths)
-    (
-        balance_median,
-        balance_low,
-        balance_high,
-        balance_fan_low,
-        balance_fan_high,
-    ) = summarize(balance_paths)
-    (
-        cumulative_median,
-        cumulative_low,
-        cumulative_high,
-        cumulative_fan_low,
-        cumulative_fan_high,
-    ) = summarize(cumulative_paths)
-    final_repayments = cumulative_paths[-1]
-    return SimulationSummary(
-        months=months,
-        monthly_repayment_median=np.median(monthly_repayment_paths, axis=1),
-        salary_median=salary_median,
-        salary_low=salary_low,
-        salary_high=salary_high,
-        salary_fan_low=salary_fan_low,
-        salary_fan_high=salary_fan_high,
-        balance_median=balance_median,
-        balance_low=balance_low,
-        balance_high=balance_high,
-        balance_fan_low=balance_fan_low,
-        balance_fan_high=balance_fan_high,
-        cumulative_median=cumulative_median,
-        cumulative_low=cumulative_low,
-        cumulative_high=cumulative_high,
-        cumulative_fan_low=cumulative_fan_low,
-        cumulative_fan_high=cumulative_fan_high,
-        salary_examples=salary_paths[:, :EXAMPLE_PATHS],
-        balance_examples=balance_paths[:, :EXAMPLE_PATHS],
-        cumulative_examples=cumulative_paths[:, :EXAMPLE_PATHS],
-        total_repaid_median=float(np.median(final_repayments)),
-        total_repaid_low=float(np.percentile(final_repayments, 2.5)),
-        total_repaid_high=float(np.percentile(final_repayments, 97.5)),
-        payoff_worthwhile_probability=float(
-            np.mean(final_repayments > sum(loan.balance for loan in loans))
-        ),
-    )
+    def summarize_view(salary_paths, balance_paths, cumulative_paths, monthly_repayment_paths):
+        (
+            salary_median,
+            salary_low,
+            salary_high,
+            salary_fan_low,
+            salary_fan_high,
+        ) = summarize(salary_paths)
+        (
+            balance_median,
+            balance_low,
+            balance_high,
+            balance_fan_low,
+            balance_fan_high,
+        ) = summarize(balance_paths)
+        (
+            cumulative_median,
+            cumulative_low,
+            cumulative_high,
+            cumulative_fan_low,
+            cumulative_fan_high,
+        ) = summarize(cumulative_paths)
+        final_repayments = cumulative_paths[-1]
+        return SimulationSummary(
+            months=months,
+            monthly_repayment_median=np.median(monthly_repayment_paths, axis=1),
+            salary_median=salary_median,
+            salary_low=salary_low,
+            salary_high=salary_high,
+            salary_fan_low=salary_fan_low,
+            salary_fan_high=salary_fan_high,
+            balance_median=balance_median,
+            balance_low=balance_low,
+            balance_high=balance_high,
+            balance_fan_low=balance_fan_low,
+            balance_fan_high=balance_fan_high,
+            cumulative_median=cumulative_median,
+            cumulative_low=cumulative_low,
+            cumulative_high=cumulative_high,
+            cumulative_fan_low=cumulative_fan_low,
+            cumulative_fan_high=cumulative_fan_high,
+            salary_examples=salary_paths[:, :EXAMPLE_PATHS],
+            balance_examples=balance_paths[:, :EXAMPLE_PATHS],
+            cumulative_examples=cumulative_paths[:, :EXAMPLE_PATHS],
+            total_repaid_median=float(np.median(final_repayments)),
+            total_repaid_low=float(np.percentile(final_repayments, 2.5)),
+            total_repaid_high=float(np.percentile(final_repayments, 97.5)),
+            payoff_worthwhile_probability=float(
+                np.mean(final_repayments > sum(loan.balance for loan in loans))
+            ),
+        )
+
+    nominal = summarize_view(salary_paths, balance_paths, cumulative_paths, monthly_repayment_paths)
+    if both_views:
+        real = summarize_view(
+            real_salary_paths, real_balance_paths, real_cumulative_paths, real_monthly_repayment_paths,
+        )
+        return nominal, real
+    return nominal
+
 
 
 
@@ -497,8 +533,16 @@ def payoff_grid(
     real_terms: bool = False,
     runs: int = SIMULATION_RUNS,
     _progress_callback: Callable[[float], None] | None = None,
+    *,
+    payoff_month: date | None = None,
+    payoff_immediately: bool = False,
+    both_views: bool = False,
+    rpi_persistence: float = RPI_PERSISTENCE,
+    rpi_innovation_std: float = RPI_INNOVATION_STD,
+    salary_persistence: float = REAL_SALARY_PERSISTENCE,
+    salary_innovation_std: float = REAL_SALARY_INNOVATION_STD,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compare paying now with required repayments; rows are balances, columns salaries.
+    """Compare paying now with the selected repayment schedule; rows are balances, columns salaries.
 
     Keep loan shares fixed and use identical random paths in every cell. Only
     totals are needed, avoiding the main chart's trajectory quantiles and cache.
@@ -508,7 +552,8 @@ def payoff_grid(
         raise ValueError("Enter a positive loan balance to define the loan proportions.")
     if not salaries or not balances or min(salaries) < 0 or min(balances) < 0:
         raise ValueError("Salary and balance axes must be nonempty and nonnegative.")
-    probabilities = np.empty((len(balances), len(salaries)))
+    shape = (len(balances), len(salaries))
+    probabilities = np.empty((2, *shape) if both_views else shape)
     savings = np.empty_like(probabilities)
     for row, balance in enumerate(balances):
         scaled_loans = tuple(
@@ -517,14 +562,49 @@ def payoff_grid(
         )
         for column, salary in enumerate(salaries):
             if balance == 0:
-                totals = np.zeros(runs)
+                totals = np.zeros((2, runs) if both_views else runs)
             else:
                 totals = simulate.__wrapped__(
                     salary, mean_real_salary_growth, scaled_loans, mean_rpi,
-                    start_month, real_terms=real_terms, runs=runs, totals_only=True,
+                    start_month, payoff_month=payoff_month, payoff_immediately=payoff_immediately,
+                    real_terms=real_terms, runs=runs, totals_only=True, both_views=both_views,
+                    rpi_persistence=rpi_persistence, rpi_innovation_std=rpi_innovation_std,
+                    salary_persistence=salary_persistence, salary_innovation_std=salary_innovation_std,
                 )
-            probabilities[row, column] = np.mean(totals > balance)
-            savings[row, column] = np.median(totals) - balance
+            if both_views:
+                probabilities[:, row, column] = np.mean(totals > balance, axis=1)
+                savings[:, row, column] = np.median(totals, axis=1) - balance
+            else:
+                probabilities[row, column] = np.mean(totals > balance)
+                savings[row, column] = np.median(totals) - balance
             if _progress_callback is not None:
-                _progress_callback((row * len(salaries) + column + 1) / probabilities.size)
+                _progress_callback((row * len(salaries) + column + 1) / (len(balances) * len(salaries)))
     return probabilities, savings
+
+
+@st.cache_data(show_spinner=False)
+def payoff_grid_views(
+    salaries: tuple[float, ...],
+    balances: tuple[float, ...],
+    loans: tuple[Loan, ...],
+    mean_real_salary_growth: float,
+    mean_rpi: float,
+    start_month: date = TODAY_MONTH,
+    payoff_month: date | None = None,
+    payoff_immediately: bool = False,
+    runs: int = SIMULATION_RUNS,
+    *,
+    rpi_persistence: float = RPI_PERSISTENCE,
+    rpi_innovation_std: float = RPI_INNOVATION_STD,
+    salary_persistence: float = REAL_SALARY_PERSISTENCE,
+    salary_innovation_std: float = REAL_SALARY_INNOVATION_STD,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cache cash and purchasing-power grids from one simulation per cell."""
+    return payoff_grid(
+        salaries, balances, loans, mean_real_salary_growth, mean_rpi, start_month,
+        runs=runs,
+        payoff_month=payoff_month, payoff_immediately=payoff_immediately,
+        both_views=True,
+        rpi_persistence=rpi_persistence, rpi_innovation_std=rpi_innovation_std,
+        salary_persistence=salary_persistence, salary_innovation_std=salary_innovation_std,
+    )
