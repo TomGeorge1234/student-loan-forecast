@@ -2,6 +2,20 @@
 
 ## Launch
 
+Double-click **Student Loan Forecast** on your Desktop to start the forecaster
+and open it in Safari. It runs in the background at <http://127.0.0.1:8502>,
+so Personal Finances can run alongside it on port 8501. Opening the desktop
+app again reuses the running server. Startup logs are in `data/streamlit.log`.
+The desktop launcher uses this folder and its `.venv`; keep them in place.
+
+To rebuild the macOS desktop app:
+
+```bash
+osacompile -o "$HOME/Desktop/Student Loan Forecast.app" "Student Loan Forecast.applescript"
+```
+
+For a terminal launch:
+
 ```bash
 uv pip install -e .
 streamlit run student_loan_gui.py
